@@ -1,0 +1,17 @@
+{
+  "name": "sheetkas-wa-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp Bot untuk input transaksi SheetKas via Koyeb",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4"
+  }
+}
