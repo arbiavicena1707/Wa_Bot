@@ -12,11 +12,34 @@ const app = express();
 const PORT = process.env.PORT || 8000;
 const DEFAULT_GAS_URL = 'https://script.google.com/macros/s/AKfycbxN3l6lTZX-UoaG0w6mM6OOe_MyuXwsOg2nyO6JIy1kpyGJtRKELYJ6MvhHDGrai01E/exec';
 const GAS_URL = process.env.GAS_URL || DEFAULT_GAS_URL;
-const TARGET_GROUP_ID = process.env.TARGET_GROUP_ID || ''; // Opsional: batasi hanya grup tertentu
+
+// KATA KUNCI NAMA GRUP (HANYA respons grup yang mengandung kata ini di namanya)
+// Anda bisa ubah atau sesuaikan dengan nama grup Anda
+const TARGET_GROUP_KEYWORDS = (process.env.TARGET_GROUP_KEYWORDS || 'sheetkas,catatan,keuangan,duit,dompet,pribadi,kas').toLowerCase().split(',');
 
 let currentQR = '';
 let connectionStatus = 'Menunggu Scan QR';
 let lastConnectedTime = null;
+const botStartTime = Date.now();
+const sentMessageIds = new Set();
+const groupMetadataCache = new Map(); // Cache nama grup agar hemat request
+
+// Helper untuk mengirim pesan & mencatat ID agar tidak loop
+async function sendBotMessage(sock, jid, content, options = {}) {
+  try {
+    const sent = await sock.sendMessage(jid, content, options);
+    if (sent?.key?.id) {
+      sentMessageIds.add(sent.key.id);
+      if (sentMessageIds.size > 500) {
+        const firstKey = sentMessageIds.values().next().value;
+        sentMessageIds.delete(firstKey);
+      }
+    }
+    return sent;
+  } catch (err) {
+    console.error('[Error Kirim Pesan]', err.message);
+  }
+}
 
 // ==========================================
 // 1. Web Dashboard (Untuk Scan QR di Browser)
@@ -42,7 +65,7 @@ app.get('/', async (req, res) => {
         <div class="card">
           <div class="badge">🟢 AKTIF & TERHUBUNG</div>
           <h2>SheetKas Bot Berjalan!</h2>
-          <p>Bot WhatsApp sudah terhubung dan siap mencatat transaksi dari WhatsApp Anda.</p>
+          <p>Bot WhatsApp sudah terhubung dan <b>DILOCK KHUSUS GRUP KEUANGAN ANDA</b>.</p>
           <div class="box">
             <b>Tips Penggunaan di Grup WA:</b><br/>
             • <code>makan bakso 25k qris</code><br/>
@@ -132,8 +155,8 @@ async function startBot() {
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
-    printQRInTerminal: true, // juga tampil di log terminal
-    browser: ['SheetKas Koyeb', 'Chrome', '1.0.0']
+    printQRInTerminal: true,
+    browser: ['SheetKas Laptop', 'Chrome', '1.0.0']
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -142,53 +165,104 @@ async function startBot() {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
       currentQR = qr;
-      console.log('[WA] QR Code baru telah dibuat. Silakan buka web untuk scan.');
+      console.log('[WA] QR Code baru telah dibuat. Silakan buka browser untuk scan.');
     }
 
     if (connection === 'close') {
       connectionStatus = 'Terputus';
       const statusCode = (lastDisconnect?.error)?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log(`[WA] Koneksi terputus (status: ${statusCode}). Mencoba menghubungkan ulang...`);
+      console.log(`[WA] Koneksi terputus (status: ${statusCode}). Reconnecting...`);
       if (shouldReconnect) {
         setTimeout(startBot, 3000);
       } else {
-        console.log('[WA] Logged out. Perlu scan QR ulang.');
+        console.log('[WA] Logged out. Silakan scan QR ulang.');
         currentQR = '';
       }
     } else if (connection === 'open') {
       connectionStatus = 'Terhubung';
       lastConnectedTime = new Date().toISOString();
       currentQR = '';
-      console.log('🎉 [WA] Berhasil terhubung ke WhatsApp!');
+      console.log('🎉 [WA] Berhasil terhubung ke WhatsApp! Pengaman grup aktif.');
     }
   });
 
   // Handle Pesan Masuk
   sock.ev.on('messages.upsert', async (m) => {
     try {
+      if (!m.messages || m.messages.length === 0) return;
       const msg = m.messages[0];
-      if (!msg || !msg.message || msg.key.fromMe) return;
+      if (!msg || !msg.message) return;
+
+      // 1. Abaikan pesan dari balasan bot sendiri (mencegah loop)
+      if (sentMessageIds.has(msg.key.id)) return;
+
+      // 2. Abaikan pesan riwayat lama sebelum bot start
+      const msgTime = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now();
+      if (msgTime < botStartTime - 10000) return;
 
       const from = msg.key.remoteJid;
       if (!from) return;
 
-      // Filter target grup jika disetel di environment
-      if (TARGET_GROUP_ID && !from.includes(TARGET_GROUP_ID)) return;
+      const isGroup = from.endsWith('@g.us');
 
-      // Ambil isi teks pesan
-      const body = msg.message.conversation ||
-                   msg.message.extendedTextMessage?.text ||
-                   msg.message.imageMessage?.caption || '';
+      // ================================================================
+      // 🔒 PENGAMAN SUPER KETAT:
+      // HANYA GRUP DENGAN NAMA 'SHEETKAS' / 'SEETKAS' & MAKSIMAL 2 ORANG!
+      // ================================================================
+      if (isGroup) {
+        let groupMeta = groupMetadataCache.get(from);
+        if (!groupMeta) {
+          try {
+            groupMeta = await sock.groupMetadata(from);
+            groupMetadataCache.set(from, groupMeta);
+          } catch (e) {
+            console.log('[Filter] Gagal mengambil metadata grup:', from);
+            return;
+          }
+        }
+
+        const groupSubject = (groupMeta?.subject || '').toLowerCase();
+        const participantCount = groupMeta?.participants?.length || 99;
+
+        const isSheetkasName = /s[he]*etkas/i.test(groupSubject);
+        const isMax2People = participantCount <= 2;
+
+        if (!isSheetkasName || !isMax2People) {
+          // BUKAN GRUP SHEETKAS ATAU ANGGOTA LEBIH DARI 2 ORANG! TOLAK & ABAIKAN TOTAL!
+          return;
+        }
+
+        console.log(`[Grup Terverifikasi]: "${groupMeta?.subject}" (${participantCount} anggota)`);
+      } else {
+        // Jika bukan grup, abaikan pesan pribadi dari orang lain (kecuali dari diri sendiri)
+        if (!msg.key.fromMe) return;
+      }
+
+      // 3. Ekstraksi teks pesan
+      let messageContent = msg.message;
+      if (messageContent?.ephemeralMessage?.message) {
+        messageContent = messageContent.ephemeralMessage.message;
+      }
+      if (messageContent?.viewOnceMessage?.message) {
+        messageContent = messageContent.viewOnceMessage.message;
+      }
+
+      const body = messageContent?.conversation ||
+                   messageContent?.extendedTextMessage?.text ||
+                   messageContent?.imageMessage?.caption || '';
 
       if (!body || typeof body !== 'string') return;
 
+      // 4. Parser SheetKas
       const parsed = parseTransaction(body);
-      if (!parsed) return; // Bukan format perintah SheetKas, abaikan
+      if (!parsed) return; // Bukan perintah transaksi
 
-      // 1. Perintah Bantuan
+      console.log(`[Perintah Diterima di Grup Khusus]: "${body}"`);
+
+      // --- Perintah Bantuan ---
       if (parsed.type === 'HELP') {
-        await sock.sendMessage(from, {
+        await sendBotMessage(sock, from, {
           text: `📌 *Panduan Format Input SheetKas*\n\n` +
                 `• *Pengeluaran:*\n` +
                 `  - \`makan siang 25k qris\`\n` +
@@ -204,9 +278,10 @@ async function startBot() {
         return;
       }
 
-      // 2. Perintah Cek Saldo
+      // --- Perintah Cek Saldo ---
       if (parsed.type === 'CHECK_BALANCE') {
         try {
+          console.log('[Mengambil Saldo dari Sheets...]');
           const res = await axios.get(GAS_URL, { timeout: 15000 });
           const summary = res.data?.summary || {};
           const formatRp = (num) => 'Rp ' + Number(num || 0).toLocaleString('id-ID');
@@ -220,15 +295,15 @@ async function startBot() {
             `🛡️ *Saldo Aman:* ${formatRp(summary.safeBalance)}\n\n` +
             `_Terakhir diperbarui: ${new Date().toLocaleTimeString('id-ID')}_`;
 
-          await sock.sendMessage(from, { text: replyText }, { quoted: msg });
+          await sendBotMessage(sock, from, { text: replyText }, { quoted: msg });
         } catch (err) {
           console.error('[Error Check Balance]', err.message);
-          await sock.sendMessage(from, { text: '❌ Gagal mengambil saldo dari Google Sheets: ' + err.message }, { quoted: msg });
+          await sendBotMessage(sock, from, { text: '❌ Gagal mengambil saldo dari Google Sheets: ' + err.message }, { quoted: msg });
         }
         return;
       }
 
-      // 3. Tambah Transaksi ke Google Sheets
+      // --- Tambah Transaksi ke Google Sheets ---
       if (parsed.type === 'TRANSACTION') {
         try {
           const now = new Date();
@@ -246,6 +321,7 @@ async function startBot() {
             category: parsed.category
           };
 
+          console.log('[Kirim Transaksi ke Sheets]:', payload);
           const res = await axios.post(GAS_URL, payload, { timeout: 20000 });
 
           if (res.data && res.data.success !== false) {
@@ -263,13 +339,14 @@ async function startBot() {
               `📅 Tanggal: ${tglStr}${sisaSaldo}\n\n` +
               `_Data otomatis tersinkron ke Flutter & Web!_`;
 
-            await sock.sendMessage(from, { text: replyText }, { quoted: msg });
+            await sendBotMessage(sock, from, { text: replyText }, { quoted: msg });
+            console.log('✅ Transaksi berhasil dicatat dan dibalas ke WhatsApp!');
           } else {
             throw new Error(res.data?.error || 'Gagal menyimpan transaksi.');
           }
         } catch (err) {
           console.error('[Error Add Transaction]', err.message);
-          await sock.sendMessage(from, { text: '❌ Gagal mencatat ke Google Sheets: ' + err.message }, { quoted: msg });
+          await sendBotMessage(sock, from, { text: '❌ Gagal mencatat ke Google Sheets: ' + err.message }, { quoted: msg });
         }
       }
     } catch (outerErr) {
